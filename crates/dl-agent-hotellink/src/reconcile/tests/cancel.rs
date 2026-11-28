@@ -267,6 +267,19 @@ fn apply_save_never_recreates_cancelled_booking() {
 }
 
 #[test]
+fn apply_save_force_recreate_overrides_staff_cancel() {
+    let repo = FakeRepo::new();
+    repo.st().cancelled_booking.insert("BK".into(), true);
+    let job = Job {
+        force_recreate: true,
+        ..dlx_job("B-9", "2026-06-17")
+    };
+    let res = new_reconciler(&repo).apply(&job).expect("apply");
+    assert!(!res.needs_manual && res.completed, "{res:?}");
+    assert!(!repo.st().inserted.is_empty());
+}
+
+#[test]
 fn apply_cancel_returns_cancel_result() {
     let repo = FakeRepo::new();
     repo.st().folios = vec![Folio {

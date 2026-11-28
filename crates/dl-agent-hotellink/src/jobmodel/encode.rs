@@ -73,6 +73,7 @@ impl Job {
                 array(out, Some(&self.extras), |out, e| e.write_json(out))
             });
         }
+        o.bool_omit("forceRecreate", self.force_recreate);
         o.end();
     }
 

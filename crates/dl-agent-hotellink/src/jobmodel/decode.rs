@@ -107,6 +107,7 @@ impl Job {
                 amount: f(e, "amount"),
             })
             .unwrap_or_default(),
+            force_recreate: b(v, "forceRecreate"),
         }
     }
 }
