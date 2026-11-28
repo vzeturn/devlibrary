@@ -137,7 +137,13 @@ impl BootstrapGrantsRepair {
 /// The outcome text of a failed run and whether the next identity may cure it.
 fn failure(e: &Error) -> (String, bool) {
     match (e.code(), e.sql()) {
-        (Some(code), _) => (code.to_owned(), is_access_refusal(code)),
+        // The target was enrolled, so a schema mismatch from a restricted identity (the
+        // service account sees no tables of the POS database) is a visibility refusal that
+        // the next identity may cure (RT-1427).
+        (Some(code), _) => (
+            code.to_owned(),
+            is_access_refusal(code) || code == crate::config::codes::FINGERPRINT_MISMATCH,
+        ),
         (None, Some(sql)) => (format!("SQL error {}", sql.number()), false),
         (None, None) => (e.to_exception().type_name, false),
     }
@@ -267,6 +273,21 @@ mod tests {
         assert_eq!(out.summary(), "windows: SQL_NO_ACCESS; sql:smile: applied");
         let json = dl_json::to_string(&out.to_json());
         assert!(!json.contains(PASSWORD), "never a password: {json}");
+    }
+
+    #[test]
+    fn a_windows_schema_mismatch_falls_back_to_the_smile_login() {
+        let (apply, ran) = runner(vec![
+            refused(codes::FINGERPRINT_MISMATCH),
+            Ok(vec!["full_rw_grants".into()]),
+        ]);
+        let repair =
+            BootstrapGrantsRepair::with_parts(attempts(Some(PASSWORD)), apply, &Logger::none());
+
+        let out = repair.try_repair(&Ctx::background());
+
+        assert_eq!(*ran.lock().unwrap(), ["windows", "smile"]);
+        assert_eq!(out.applied_by(), Some("sql:smile"));
     }
 
     #[test]
