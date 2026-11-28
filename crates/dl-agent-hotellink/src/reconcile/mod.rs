@@ -272,10 +272,21 @@ impl Reconciler {
         let (ta, sts) = self.lookup_travel_agent(&job.source_name)?;
 
         if existing.is_empty() {
-            if self
+            let mut cancelled_before = self
                 .repo
-                .has_user_cancelled_folio(&job.booker, &job.booking_id)?
-            {
+                .has_user_cancelled_folio(&job.booker, &job.booking_id)?;
+            if cancelled_before && job.force_recreate {
+                // RT-1306: HL still holds the booking, the hub asked to book it again.
+                log::warn(
+                    "hub ép tạo lại booking đã bị user hủy",
+                    &[
+                        ("bookingId", V::S(&job.booking_id)),
+                        ("booker", V::S(&job.booker)),
+                    ],
+                );
+                cancelled_before = false;
+            }
+            if cancelled_before {
                 let reason = format!(
                     "booking {}: đã từng bị hủy ở PMS trước đó (bởi user), từ chối tạo lại — cần xử lý tay",
                     job.booking_id

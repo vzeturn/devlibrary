@@ -123,6 +123,9 @@ pub struct Job {
     pub payments: Vec<HlPayment>,
     /// `extras` (omitempty).
     pub extras: Vec<HlExtra>,
+    /// `forceRecreate` (omitempty): the hub asks to book again a booking staff cancelled in
+    /// PMS while Hotel Link still holds it (RT-1306). Not part of the content hash.
+    pub force_recreate: bool,
 }
 
 impl Job {
