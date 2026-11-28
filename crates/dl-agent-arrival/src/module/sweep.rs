@@ -41,6 +41,11 @@ const MESSAGE_CHARS: usize = 240;
 pub const LOCK_TIMEOUT_MS: u32 = 2000;
 /// Made inside each operation's transaction: proof the rollback undid that transaction.
 const MARK: &str = "#dl_sweep_tx";
+/// Operations a sweep never calls, whatever the command asks (RT-1496). `folio.post-payment` takes the folio
+/// posting lock, posts through SMILE's own `PostOneTransaction` and rolls back its own transaction on a refusal,
+/// so it is the one procedure of the bundle outside the no-`ROLLBACK` / no-`EXEC` rule that makes
+/// `aborted` sound; a payment is proved on a test PMS, never by a sweep of a hotel's.
+pub const NEVER_SWEPT: &[&str] = &["folio.post-payment"];
 
 /// What the command asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -208,7 +213,9 @@ pub fn sweep<'a>(target: impl Into<tds::Target<'a>>, opts: &SweepOptions) -> Res
         if !opts.only.is_empty() && !opts.only.contains(&op.name) {
             continue;
         }
-        let row = if opts.skip.contains(&op.name) {
+        let row = if NEVER_SWEPT.contains(&op.name.as_str()) {
+            skipped(op, "never swept: it posts a payment on the folio")
+        } else if opts.skip.contains(&op.name) {
             skipped(op, "left out by the command")
         } else {
             let row = run_one(&mut client, op, opts);
@@ -546,10 +553,20 @@ mod tests {
     }
 
     /// What makes `aborted` sound: nothing of the bundle runs after an aborting error, and
-    /// every catalog operation calls a procedure of the bundle.
+    /// every catalog operation calls a procedure of the bundle. The procedures of
+    /// [`NEVER_SWEPT`] are the only exception, and a sweep never calls them. The words are read
+    /// in this crate's procedures: the shared SA_ layer that the installer puts first creates
+    /// `SA_FolioBill` at install time inside a TRY/CATCH around `EXEC` (RT-1484), which never
+    /// runs during a sweep.
     #[test]
     fn the_bundle_never_rolls_back_catches_or_calls_out() {
-        let text = installer::bundle().text.to_uppercase();
+        let full = installer::bundle().text.to_uppercase();
+        let source = include_str!("../../assets/pms-procedures.sql").to_uppercase();
+        let text = without_never_swept(&source);
+        assert!(
+            text.len() < source.len(),
+            "the never-swept procedures are in the bundle"
+        );
         for word in ["ROLLBACK", "BEGIN TRY", "BEGIN CATCH", "SAVE TRAN"] {
             assert!(!text.contains(word), "the bundle has {word}");
         }
@@ -561,11 +578,44 @@ mod tests {
         }
         for op in catalog().expect("catalog").operations() {
             let made = format!("CREATE PROCEDURE DBO.{}", op.procedure.to_uppercase());
-            let found = text
+            let found = full
                 .match_indices(&made)
-                .any(|(i, _)| text[i + made.len()..].starts_with(char::is_whitespace));
+                .any(|(i, _)| full[i + made.len()..].starts_with(char::is_whitespace));
             assert!(found, "{} is not in the bundle", op.procedure);
         }
+    }
+
+    /// The bundle text (upper case) without the bodies of the [`NEVER_SWEPT`] procedures: each
+    /// `CREATE PROCEDURE` up to the next batch marker.
+    fn without_never_swept(text: &str) -> String {
+        let mut out = text.to_string();
+        for name in NEVER_SWEPT {
+            let proc = catalog()
+                .expect("catalog")
+                .operations()
+                .iter()
+                .find(|o| o.name == *name)
+                .unwrap_or_else(|| panic!("{name} is not in the catalog"))
+                .procedure
+                .to_uppercase();
+            let made = format!("CREATE PROCEDURE DBO.{proc}");
+            let start = out
+                .find(&made)
+                .unwrap_or_else(|| panic!("{proc} is not in the bundle"));
+            let end = out[start..]
+                .find("-- @@MMARRIVAL:BATCH")
+                .map_or(out.len(), |i| start + i);
+            out.replace_range(start..end, "");
+        }
+        out
+    }
+
+    #[test]
+    fn the_sweep_never_calls_a_payment_post() {
+        for name in NEVER_SWEPT {
+            assert!(op(name).kind == OperationKind::Write, "{name} is a write");
+        }
+        assert!(NEVER_SWEPT.contains(&"folio.post-payment"));
     }
 
     #[test]

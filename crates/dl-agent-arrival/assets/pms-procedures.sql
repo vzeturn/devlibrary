@@ -1501,11 +1501,17 @@ BEGIN
         dbo.fTCVNToUnicode(CASE WHEN B.Source = 'FO'
             THEN COALESCE(NULLIF(RTRIM(TC.Description), ''), NULLIF(RTRIM(B.ItemName), ''), '')
             ELSE COALESCE(NULLIF(RTRIM(B.ItemName), ''), NULLIF(RTRIM(B.ItemCode), ''), '') END) AS Description,
-        CAST(B.RefNo AS VARCHAR(30)) AS RefNo
+        CAST(B.RefNo AS VARCHAR(30)) AS RefNo,
+        -- RT-1496: the group of the folio line's code (2 payment, 3 transfer): printed as paid, not as a discount.
+        CASE WHEN B.Source = 'FO' THEN TG.TransactionGroup END AS TransactionGroup
     FROM dbo.SA_FolioBill(@sFolioNum, @sBalanceCode) B
     -- RT-1432: the code + sub code join lives in the shared SA_ layer (dbo.SA_TrnCode_Resolve, installed ahead of
     -- this bundle); no exact sub falls back to sub 0, never to another sub code of the same code.
     OUTER APPLY dbo.SA_TrnCode_Resolve(B.TransactionCode, B.TransactionSubCode, 1, 0) TC
+    OUTER APPLY (SELECT TOP 1 T.TransactionGroup FROM dbo.TransactionCode T WITH (NOLOCK)
+                 WHERE T.TransactionCode = TC.TransactionCode
+                   AND (T.TransactionSubCode = TC.TransactionSubCode
+                        OR (T.TransactionSubCode IS NULL AND TC.TransactionSubCode IS NULL))) TG
     ORDER BY B.TransDate, B.TransactionID, B.LineSeq;
 END
 -- @@mmarrival:batch pms
@@ -3358,4 +3364,137 @@ BEGIN
     INSERT INTO dbo.RoomMaintainant (RoomCode, Status, BeginTime, AssignStaff, Notes, CreateDate)
     VALUES (@RoomCode, 0, @BeginTime, @AssignStaff, @Notes, GETDATE());
     SELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS nSeq;
+END
+-- @@mmarrival:batch pms
+IF OBJECT_ID('dbo.srCI_PostFolioPayment', 'P') IS NOT NULL DROP PROCEDURE dbo.srCI_PostFolioPayment
+-- @@mmarrival:batch pms
+CREATE PROCEDURE dbo.srCI_PostFolioPayment
+    @FolioNum        DECIMAL(18,0),
+    @BalanceCode     VARCHAR(20),
+    @Amount          DECIMAL(18,2),
+    @PaymentTypeCode VARCHAR(20),
+    @Reference       NVARCHAR(50) = NULL,
+    @UserName        NVARCHAR(40) = NULL,
+    @RequestKey      VARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET DEADLOCK_PRIORITY LOW;
+
+    DECLARE @Code VARCHAR(20) = UPPER(LTRIM(RTRIM(ISNULL(@BalanceCode, ''))));
+    DECLARE @PayCode VARCHAR(20) = UPPER(LTRIM(RTRIM(ISNULL(@PaymentTypeCode, ''))));
+    DECLARE @Key VARCHAR(100) = LTRIM(RTRIM(ISNULL(@RequestKey, '')));
+    DECLARE @User NVARCHAR(40) = LTRIM(RTRIM(ISNULL(@UserName, N'')));
+    IF ISNULL(@FolioNum, 0) <= 0 OR @Code = '' OR LEN(@Code) > 2 OR @Code IN ('C', 'V', 'P')
+    BEGIN RAISERROR('srCI_PostFolioPayment: no such folio bill window, nothing posted', 16, 1); RETURN; END
+    IF @Amount IS NULL OR @Amount <= 0
+    BEGIN RAISERROR('srCI_PostFolioPayment: the amount must be positive, nothing posted', 16, 2); RETURN; END
+    IF @PayCode = '' OR @Key = ''
+    BEGIN RAISERROR('srCI_PostFolioPayment: payment code and request key are required, nothing posted', 16, 3); RETURN; END
+
+    -- The request key is kept as the line's reference number (30 chars): a key already posted on this folio returns
+    -- that first line instead of posting again, before any other check (a retry after the bill changed is a no-op).
+    DECLARE @FolioKey VARCHAR(10) = CAST(@FolioNum AS VARCHAR(10));
+    DECLARE @Ref VARCHAR(30) = 'CI' + LEFT(CONVERT(VARCHAR(40), HASHBYTES('SHA1', @Key), 2), 28);
+    DECLARE @rc INT, @Tid DECIMAL(18,0), @TidFolio VARCHAR(10), @TidCode VARCHAR(5);
+
+    BEGIN TRANSACTION;
+    -- The posting lock every azolo writer takes before it touches folio lines (one post at a time). Shorter than the
+    -- agent's command timeout, so a busy PMS refuses cleanly instead of timing out mid-call.
+    EXEC @rc = sp_getapplock @Resource = 'SMILE_FolioTransaction', @LockMode = 'Exclusive',
+        @LockOwner = 'Transaction', @LockTimeout = 5000;
+    IF @rc < 0
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: folio posting is busy, nothing posted', 16, 4); RETURN; END
+
+    SELECT TOP 1 @Tid = TransactionID FROM dbo.FolioTransaction
+    WHERE FolioNum = @FolioKey AND RefNumber = @Ref
+    ORDER BY TransactionID;
+    IF @Tid IS NOT NULL
+    BEGIN
+        COMMIT TRANSACTION;
+        SELECT CAST(@Tid AS VARCHAR(30)) AS TransactionRef;
+        RETURN;
+    END
+
+    -- In house only, never a cancelled or no-post folio (the desk's own posting rules).
+    DECLARE @Status INT, @Cancel DECIMAL(18,0), @NoPost INT, @HotelID VARCHAR(50);
+    SELECT TOP 1 @Status = FolioStatus, @Cancel = ISNULL(CancelNum, 0), @NoPost = ISNULL(CAST(NoPostFlag AS INT), 0),
+        @HotelID = HotelID
+    FROM dbo.Folio WITH (UPDLOCK)
+    WHERE FolioNum = @FolioNum
+    ORDER BY FolioSubNum;
+    IF @Status IS NULL OR @Status <> 2 OR @Cancel <> 0
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: the folio is not in house, nothing posted', 16, 5); RETURN; END
+    IF @NoPost <> 0
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: posting is blocked on this folio, nothing posted', 16, 6); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM dbo.FolioBalanceCode WHERE UPPER(LTRIM(RTRIM(BalanceCode))) = @Code)
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: no such folio bill window, nothing posted', 16, 7); RETURN; END
+
+    -- The hotel's payment code (Payment, as the cashier picks it), else a payment transaction code itself.
+    DECLARE @TrnCode VARCHAR(10), @TrnSub VARCHAR(10), @Desc NVARCHAR(100), @Cur VARCHAR(10), @Group INT;
+    SELECT TOP 1 @TrnCode = LTRIM(RTRIM(P.TransactionCode)), @TrnSub = LTRIM(RTRIM(ISNULL(P.TransactionSubCode, ''))),
+        @Desc = P.Description, @Cur = LTRIM(RTRIM(ISNULL(P.CurrencyCode, '')))
+    FROM dbo.Payment P
+    WHERE UPPER(LTRIM(RTRIM(P.PaymentCode))) = @PayCode AND LTRIM(RTRIM(ISNULL(P.TransactionCode, ''))) <> ''
+    ORDER BY CASE WHEN P.HotelID = @HotelID THEN 0 ELSE 1 END;
+    IF @TrnCode IS NULL
+        SELECT TOP 1 @TrnCode = LTRIM(RTRIM(T.TransactionCode)), @TrnSub = LTRIM(RTRIM(ISNULL(T.TransactionSubCode, ''))),
+            @Desc = T.Description, @Cur = LTRIM(RTRIM(ISNULL(T.CurrencyCode, '')))
+        FROM dbo.TransactionCode T
+        WHERE UPPER(LTRIM(RTRIM(T.TransactionCode))) = @PayCode AND T.TransactionGroup = 2
+        ORDER BY CASE WHEN LTRIM(RTRIM(ISNULL(T.TransactionSubCode, ''))) IN ('', '0', '00', '000') THEN 0 ELSE 1 END,
+            CASE WHEN T.HotelID = @HotelID THEN 0 ELSE 1 END;
+    -- The code as the transaction code table spells it (the tax lookup matches it exactly), and it must be a payment.
+    SELECT TOP 1 @Group = T.TransactionGroup, @TrnSub = LTRIM(RTRIM(ISNULL(T.TransactionSubCode, '')))
+    FROM dbo.TransactionCode T
+    WHERE UPPER(LTRIM(RTRIM(T.TransactionCode))) = UPPER(@TrnCode)
+    ORDER BY CASE WHEN LTRIM(RTRIM(ISNULL(T.TransactionSubCode, ''))) = @TrnSub THEN 0
+                  WHEN LTRIM(RTRIM(ISNULL(T.TransactionSubCode, ''))) IN ('', '0', '00', '000') THEN 1 ELSE 2 END;
+    IF @TrnCode IS NULL OR ISNULL(@Group, 0) <> 2
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: the payment code is not a PMS payment, nothing posted', 16, 8); RETURN; END
+    IF @TrnSub = '' SET @TrnSub = '0';
+    IF @Cur <> '' AND EXISTS (SELECT 1 FROM dbo.CurrencyDef WHERE IsBase = 1)
+       AND NOT EXISTS (SELECT 1 FROM dbo.CurrencyDef WHERE IsBase = 1 AND UPPER(LTRIM(RTRIM(CurrencyCode))) = UPPER(@Cur))
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: the payment code is in a foreign currency, nothing posted', 16, 9); RETURN; END
+
+    -- Never more than the bill still owes: the guest paid what the bill showed, so a changed bill is refused.
+    DECLARE @Bal DECIMAL(18,2) = (SELECT ISNULL(SUM(TransactionAmount), 0) FROM dbo.FolioTransaction
+                                  WHERE FolioNum = @FolioKey AND UPPER(LTRIM(RTRIM(FolioBalanceCode))) = @Code);
+    IF @Amount > @Bal
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: the amount is more than the bill balance, nothing posted', 16, 10); RETURN; END
+
+    -- The confirming clerk as the PMS posting clerk when the name is a clerk (the column holds 3 characters).
+    DECLARE @Clerk VARCHAR(10) = '';
+    IF @User <> N''
+        SELECT TOP 1 @Clerk = LTRIM(RTRIM(ClerkID)) FROM dbo.Clerk
+        WHERE LTRIM(RTRIM(ClerkID)) = @User OR LTRIM(RTRIM(UserName)) = @User
+        ORDER BY CASE WHEN LTRIM(RTRIM(ClerkID)) = @User THEN 0 ELSE 1 END;
+    IF LEN(@Clerk) > 3 SET @Clerk = '';
+
+    DECLARE @Neg DECIMAL(18,2) = -@Amount;
+    DECLARE @Note NVARCHAR(200) = LEFT(LTRIM(RTRIM(ISNULL(@Reference, N'')))
+        + CASE WHEN @User = N'' THEN N'' ELSE N' - ' + @User END, 200);
+    DECLARE @Desc50 NVARCHAR(50) = LEFT(LTRIM(RTRIM(ISNULL(@Desc, N''))), 50);
+    EXEC dbo.PostOneTransaction @FolioNum = @FolioKey, @BillAmount = @Neg, @BillExRate = 1,
+        @TransactionCode = @TrnCode, @TransactionSubCode = @TrnSub, @RefNumber = @Ref,
+        @TransactionAmount = @Neg, @FolioBalanceCode = @Code, @Comment = @Note,
+        @PostingClerkID = @Clerk, @LastChangeClerkID = @Clerk, @Description = @Desc50;
+
+    -- The hotel's routing can move a line to another folio: a payment must land on the bill the guest paid.
+    SET @Tid = NULL;
+    SELECT TOP 1 @Tid = TransactionID, @TidFolio = LTRIM(RTRIM(FolioNum)), @TidCode = UPPER(LTRIM(RTRIM(FolioBalanceCode)))
+    FROM dbo.FolioTransaction
+    WHERE RefNumber = @Ref
+      AND (FolioNum = @FolioKey
+           OR FolioNum IN (SELECT CAST(CAST(R.ToFolioNum AS DECIMAL(18,0)) AS VARCHAR(10)) FROM dbo.ChargeRoot R
+                           WHERE R.FolioNum = @FolioKey AND R.ToFolioNum IS NOT NULL))
+    ORDER BY TransactionID;
+    IF @Tid IS NULL
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: the posted line was not found, nothing posted', 16, 11); RETURN; END
+    IF @TidFolio <> @FolioKey OR @TidCode <> @Code
+    BEGIN ROLLBACK TRANSACTION; RAISERROR('srCI_PostFolioPayment: the bill window routes payments to another folio, nothing posted', 16, 12); RETURN; END
+
+    COMMIT TRANSACTION;
+    SELECT CAST(@Tid AS VARCHAR(30)) AS TransactionRef;
 END

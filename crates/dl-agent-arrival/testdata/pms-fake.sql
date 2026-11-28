@@ -383,6 +383,9 @@ INSERT dbo.AutoProfileNumber VALUES (100);
 GO
 -- Folio columns that only surface once the guest tables above exist (procedures joining them are no longer deferred).
 ALTER TABLE dbo.Folio ADD CompanyName NVARCHAR(200) NULL, TravelAgent1Code INT NULL;
+-- RT-1496: what srCI_PostFolioPayment and the bill's TransactionGroup read.
+ALTER TABLE dbo.Folio ADD NoPostFlag BIT NULL, HotelID NVARCHAR(50) NULL;
+ALTER TABLE dbo.TransactionCode ADD TransactionGroup INT NULL, CurrencyCode NVARCHAR(10) NULL, HotelID NVARCHAR(50) NULL;
 GO
 -- Rooms and the numbering counters, for op_sweep's rollback proof (tests/sql_live.rs): the columns the room and
 -- walk-in procedures (srCI_HousekeepingRooms, srCI_HousekeepingUpdateRoomStatus, srCI_AssignRoomToFolio,
