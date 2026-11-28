@@ -714,6 +714,68 @@
       "deferrable": false
     },
     {
+      "name": "folio.post-payment",
+      "kind": "write",
+      "procedure": "srCI_PostFolioPayment",
+      "parameters": [
+        {
+          "name": "FolioNum",
+          "type": "Decimal",
+          "required": true,
+          "maxLength": 0
+        },
+        {
+          "name": "BalanceCode",
+          "type": "String",
+          "required": true,
+          "maxLength": 20
+        },
+        {
+          "name": "Amount",
+          "type": "Decimal",
+          "required": true,
+          "maxLength": 0
+        },
+        {
+          "name": "PaymentTypeCode",
+          "type": "String",
+          "required": true,
+          "maxLength": 20
+        },
+        {
+          "name": "Reference",
+          "type": "String",
+          "required": false,
+          "maxLength": 50
+        },
+        {
+          "name": "UserName",
+          "type": "String",
+          "required": false,
+          "maxLength": 40
+        },
+        {
+          "name": "RequestKey",
+          "type": "String",
+          "required": true,
+          "maxLength": 100
+        }
+      ],
+      "resultSets": [
+        {
+          "columns": null,
+          "keyColumns": []
+        }
+      ],
+      "cacheTtlSeconds": 0,
+      "maxRows": 1,
+      "invalidates": [
+        "folio.bill",
+        "folio.balance-codes"
+      ],
+      "deferrable": false
+    },
+    {
       "name": "folio.print-breakfast-voucher",
       "kind": "write",
       "procedure": "srCI_PrintBreakfastVoucher",

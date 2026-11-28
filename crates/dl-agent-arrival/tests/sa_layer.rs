@@ -47,6 +47,9 @@ fn bill_procedure_reads_the_shared_folio_bill_function() {
         .expect("bill procedure batch");
     assert!(func < bill_idx);
     let bill = &b.batches[bill_idx];
-    assert!(bill.sql.contains("dbo.SA_FolioBill(@sFolioNum, @sBalanceCode)"));
+    assert!(
+        bill.sql
+            .contains("dbo.SA_FolioBill(@sFolioNum, @sBalanceCode)")
+    );
     assert!(!bill.sql.contains("dbo.FolioTransaction"));
 }

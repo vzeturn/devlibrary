@@ -66,7 +66,7 @@ fn projection_of(v: &Value) -> Option<Projection> {
 #[test]
 fn catalog_loads_with_every_procedure_in_the_bundle() {
     let cat = catalog().expect("catalog");
-    assert_eq!(cat.operations().len(), 88);
+    assert_eq!(cat.operations().len(), 89);
     let bundle = include_str!("../assets/pms-procedures.sql").to_lowercase();
     for op in cat.operations() {
         let needle = op.procedure.to_lowercase();
